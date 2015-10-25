@@ -8,82 +8,29 @@ import (
 )
 
 const (
-	dbusRemoveMatch                 = "org.freedesktop.DBus.RemoveMatch"
-	dbusAddMatch                    = "org.freedesktop.DBus.AddMatch"
-	objectPath                      = "/org/freedesktop/Notifications" // the DBUS object path
-	dbusNotificationsInterface      = "org.freedesktop.Notifications"  // DBUS Interface
-	signalNotificationClosed        = "org.freedesktop.Notifications.NotificationClosed"
-	signalNotificationActionInvoked = "org.freedesktop.Notifications.ActionInvoked"
-	getCapabilities                 = "org.freedesktop.Notifications.GetCapabilities"
-	closeNotification               = "org.freedesktop.Notifications.CloseNotification"
-	notify                          = "org.freedesktop.Notifications.Notify"
-	getServerInformation            = "org.freedesktop.Notifications.GetServerInformation"
+	objectPath                 = "/org/freedesktop/Notifications" // the DBUS object path
+	dbusNotificationsInterface = "org.freedesktop.Notifications"  // DBUS Interface
+	getCapabilities            = "org.freedesktop.Notifications.GetCapabilities"
+	closeNotification          = "org.freedesktop.Notifications.CloseNotification"
+	notify                     = "org.freedesktop.Notifications.Notify"
+	getServerInformation       = "org.freedesktop.Notifications.GetServerInformation"
 )
 
 // New creates a new Notificator using conn
-// New sets up a Notifier that listenes on dbus' signals regarding
-// Notifications, e.g.
-func New(conn *dbus.Conn) (Notifier, error) {
+func New(conn *dbus.Conn) Notifier {
 	n := &notifier{
-		conn:   conn,
-		signal: make(chan *dbus.Signal, 5),
-		closer: make(chan *NotificationClosedSignal, 5),
-		action: make(chan *ActionInvokedSignal, 5),
-		done:   make(chan bool),
+		conn: conn,
 	}
 
-	call := n.conn.BusObject().Call(dbusAddMatch, 0,
+	n.conn.BusObject().Call("org.freedesktop.DBus.AddMatch", 0,
 		"type='signal',path='"+objectPath+"',interface='"+dbusNotificationsInterface+"'")
-	if call.Err != nil {
-		return nil, call.Err
-	}
 
-	go (func() {
-		received := 0
-		for {
-			select {
-			case signal := <-n.signal:
-				received += 1
-				log.Printf("got signal: %v Signal: %+v", received, signal)
-				go n.handleSignal(signal)
-			// its all over, exit and go home
-			case <-n.done:
-				log.Printf("its all over, go home")
-				return
-			}
-		}
-	})()
-
-	// setup signal reception
-	n.conn.Signal(n.signal)
-
-	return n, nil
-}
-
-func (n notifier) handleSignal(signal *dbus.Signal) {
-	switch signal.Name {
-	case signalNotificationClosed:
-		n.closer <- &NotificationClosedSignal{
-			Id:     signal.Body[0].(uint32),
-			Reason: signal.Body[1].(uint32),
-		}
-	case signalNotificationActionInvoked:
-		n.action <- &ActionInvokedSignal{
-			Id:        signal.Body[0].(uint32),
-			ActionKey: signal.Body[1].(string),
-		}
-	default:
-		log.Printf("unknown signal: %+v", signal)
-	}
+	return n
 }
 
 // notifier implements Notificator
 type notifier struct {
-	conn   *dbus.Conn
-	signal chan *dbus.Signal
-	closer chan *NotificationClosedSignal
-	action chan *ActionInvokedSignal
-	done   chan bool
+	conn *dbus.Conn
 }
 
 // Notification holds all information needed for creating a notification
@@ -230,37 +177,53 @@ func (n *notifier) GetServerInformation() (ServerInformation, error) {
 }
 
 type NotificationClosedSignal struct {
-	Id     uint32
+	Id uint32
 	Reason uint32
 }
 
-func (n *notifier) NotificationClosed() <-chan *NotificationClosedSignal {
-	return n.closer
+func (n *notifier) NotificationClosed(closed chan<- *NotificationClosedSignal) {
+	c := make(chan *dbus.Signal, len(closed))
+
+	go (func() {
+		for {
+			signal := <-c
+			if signal.Name != dbusNotificationsInterface+".NotificationClosed" {
+				continue
+			}
+
+			closed <- &NotificationClosedSignal{
+				Id: signal.Body[0].(uint32),
+				Reason: signal.Body[1].(uint32),
+			}
+		}
+	})()
+
+	n.conn.Signal(c)
 }
 
 type ActionInvokedSignal struct {
-	Id        uint32
+	Id uint32
 	ActionKey string
 }
 
-func (n *notifier) ActionInvoked() <-chan *ActionInvokedSignal {
-	return n.action
-}
+func (n *notifier) ActionInvoked(action chan<- *ActionInvokedSignal) {
+	c := make(chan *dbus.Signal, len(action))
 
-// Close cleans up and shuts down signal delivery loop
-func (n *notifier) Close() error {
-	log.Printf("closing!")
-	n.done <- true
-	n.conn.BusObject().Call(dbusRemoveMatch, 0,
-		"type='signal',path='"+objectPath+"',interface='"+dbusNotificationsInterface+"'")
+	go (func() {
+		for {
+			signal := <-c
+			if signal.Name != dbusNotificationsInterface+".ActionInvoked" {
+				continue
+			}
 
-	// remove signal reception
-	defer n.conn.Signal(n.signal)
-	close(n.closer)
-	close(n.action)
-	close(n.done)
-	err := n.conn.Close()
-	return err
+			action <- &ActionInvokedSignal{
+				Id: signal.Body[0].(uint32),
+				ActionKey: signal.Body[1].(string),
+			}
+		}
+	})()
+
+	n.conn.Signal(c)
 }
 
 // Notifier is an interface for implementing the operations supported by the
@@ -270,7 +233,6 @@ type Notifier interface {
 	GetCapabilities() ([]string, error)
 	GetServerInformation() (ServerInformation, error)
 	CloseNotification(id int) (bool, error)
-	NotificationClosed() <-chan *NotificationClosedSignal
-	ActionInvoked() <-chan *ActionInvokedSignal
-	Close() error
+	NotificationClosed(closed chan<- *NotificationClosedSignal)
+	ActionInvoked(action chan<- *ActionInvokedSignal)
 }
